@@ -5,6 +5,7 @@ filelength: int
 filename: str
 
 sequence: int
+checksum: bytes
 data: bytes
 '''
 
