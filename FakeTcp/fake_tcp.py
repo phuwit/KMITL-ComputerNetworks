@@ -1,8 +1,10 @@
-from os import unlink
+from os import path, unlink
 from zlib import crc32
-from socket import AF_INET, SOCK_STREAM, socket
+from socket import AF_INET, SOCK_DGRAM, socket
 from typing import Dict, List, Tuple
+import logging
 
+logging.basicConfig(level=logging.DEBUG, format='[%(asctime)s] %(levelname)s: %(message)s')
 
 class Constants:
     """
@@ -57,7 +59,7 @@ class Server:
     def __init__(self, server_ip: str, server_port: int):
         self.__server_ip = server_ip
         self.__server_port = server_port
-        self.__socket = socket(AF_INET, SOCK_STREAM)
+        self.__socket = socket(AF_INET, SOCK_DGRAM)
         self.__socket.bind((self.__server_ip, self.__server_port))
         self.__socket.settimeout(Constants.CONNECTION_END_NULLS_COUNT)
 
@@ -66,9 +68,14 @@ class Server:
     def process_segment(self, segment: bytes) -> None:
         sequence_number, claimed_crc32sum = Utilities.decode_headers(segment)
         payload = segment[Constants.HEADER_SIZE::]
+        # logging.info(f"payload {payload}")
         if crc32(payload) != claimed_crc32sum:
+            logging.warning(f"crc mismatch {claimed_crc32sum} {crc32(payload)}")
             return None
+        # logging.debug(f"segment #{sequence_number} {payload}")
+
         self.__segments[sequence_number] = payload
+        logging.debug(f"all segments {self.__segments.keys()}")
 
     # def process_segments(self, segments: List[bytes]) -> None:
     #     for segment in segments:
@@ -79,27 +86,32 @@ class Server:
     #         segments[sequence_number] = payload
 
     def recieve(self):
-        client_socket, client_address = self.__socket.accept()
-        client_socket.settimeout(Constants.CONNECTION_END_NULLS_COUNT)
+        # self.__socket.bind(("127.0.0.1", 5001))
+        self.__socket.settimeout(Constants.CONNECTION_END_NULLS_COUNT)
 
         nulls: int = 0
         possible_nulls: List[bytes] = []
         filename: str = "file"
         next_segment: int = 0
 
-        unlink(filename)
+        if path.exists(filename):
+            unlink(filename)
 
         while True:
-            data = client_socket.recv(Constants.PAYLOAD_SIZE)
-            if data == b"":
+            segment, _ = self.__socket.recvfrom(Constants.SEGMENT_SIZE)
+            # logging.info(f"data {segment}")
+            # logging.info(f"nulls {nulls}")
+            if segment == b"":
                 if nulls <= Constants.CONNECTION_END_NULLS_COUNT:
                     nulls += 1
-                    possible_nulls.append(data)
+                    possible_nulls.append(segment)
                 else:
-                    if Constants.LOGGING:
-                        print("closing connection after recieving nulls")
+                    logging.warning("closing connection after recieving nulls")
                     break
             else:
+                self.process_segment(segment)
+                # logging.info(f"segment {segment}")
+
                 if nulls != 0:
                     nulls = 0
                     for segment in possible_nulls:
@@ -108,6 +120,7 @@ class Server:
                 with open("file", "ab") as file:
                     while next_segment in self.__segments:
                         segment = self.__segments.pop(next_segment)
+                        logging.debug(f"writing {next_segment} {segment}")
                         next_segment += Constants.PAYLOAD_SIZE
                         file.write(segment)
 
@@ -121,19 +134,20 @@ class Client:
     def __init__(self, server_ip: str, server_port: int):
         self.__server_ip = server_ip
         self.__server_port = server_port
-        self.__socket = socket(AF_INET, SOCK_STREAM)
+        self.__socket = socket(AF_INET, SOCK_DGRAM)
         self.__socket.connect((self.__server_ip, self.__server_port))
 
     def send(self, filename: str):
-        if Constants.LOGGING:
-            payload_no = 1
+        segment_number = 0
         with open(filename, "rb") as file:
             while payload := file.read(Constants.PAYLOAD_SIZE):
-                if Constants.LOGGING:
-                    payload_no += 1
-                    print("Payload count:", payload_no)
+                logging.debug(f"segment number {segment_number}")
+
                 checksum = crc32(payload)
-                headers = Utilities.encode_headers(1234, checksum)
+                headers = Utilities.encode_headers(segment_number, checksum)
                 segment = headers + payload
+                logging.debug(f"payload {payload}")
+                logging.debug(f"crc32sum {checksum}")
+                segment_number += Constants.PAYLOAD_SIZE
                 self.__socket.send(segment)
             self.__socket.close()
