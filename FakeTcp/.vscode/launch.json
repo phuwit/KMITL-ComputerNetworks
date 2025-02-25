@@ -17,7 +17,7 @@
       "type": "debugpy",
       "request": "launch",
       "program": "urft_client.py",
-      "args": ["quad9-resolvers.md", "127.0.0.1", "5000"],
+      "args": ["testfiles/simple-icons--python.svg", "127.0.0.1", "5000"],
       "console": "integratedTerminal",
     }
   ]
