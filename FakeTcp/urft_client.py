@@ -15,11 +15,11 @@ def main():
     except Exception:
         print("3 arguments required: filename server_ip server_port")
         return
-        
+
     client = Client(server_ip=server_ip, server_port=server_port)
-    client.send(filename)
-    
-    
+    client.send_file(filename)
+
+
 
 if __name__ == '__main__':
     main()
