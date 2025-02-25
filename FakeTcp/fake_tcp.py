@@ -45,6 +45,7 @@ class Constants:
     HEADER_TYPE_LENGTH = 1
     HEADER_SEQUENCE_LENGTH = 4
     HEADER_CHECKSUM_LENGTH = 4
+    HEADER_FILESIZE_LENGTH = 4
 
     MAX_SEGMENT_SIZE: int = 1024
     HEADER_SIZE: int = (
@@ -58,14 +59,28 @@ class Constants:
     CONSECUTIVE_PACKETS_TIMEOUT: float = 2
     CONNECTION_END_NULLS_COUNT: int = 10
 
+    INIT_SEQUENCE_NUMBER = int.from_bytes(b'ffff', HEADER_BYTEORDER) -1
+
 
 class Utilities:
     @staticmethod
-    def encode_headers(
-        type: Constants.SEGMENT_TYPE, sequence_number: int, crc32sum: int
+    def encode_init(filesize: int, filename: str) -> bytes:
+        segment = bytes()
+        segment += Constants.SEGMENT_TYPE.INIT.value.to_bytes(
+            Constants.HEADER_TYPE_LENGTH, Constants.HEADER_BYTEORDER
+        )
+        segment += filesize.to_bytes(
+            Constants.HEADER_SEQUENCE_LENGTH, Constants.HEADER_BYTEORDER
+        )
+        segment += filename.encode()
+        return segment
+
+    @staticmethod
+    def encode_data_headers(
+        sequence_number: int, crc32sum: int
     ) -> bytes:
         headers = bytes()
-        headers += type.value.to_bytes(
+        headers += Constants.SEGMENT_TYPE.DATA.value.to_bytes(
             Constants.HEADER_TYPE_LENGTH, Constants.HEADER_BYTEORDER
         )
         headers += sequence_number.to_bytes(
@@ -78,17 +93,35 @@ class Utilities:
 
     @staticmethod
     def encode_ack(sequence_number: int) -> bytes:
-        headers = bytes()
-        headers += Constants.SEGMENT_TYPE.ACK.value.to_bytes(
+        segment = bytes()
+        segment += Constants.SEGMENT_TYPE.ACK.value.to_bytes(
             Constants.HEADER_TYPE_LENGTH, Constants.HEADER_BYTEORDER
         )
-        headers += sequence_number.to_bytes(
+        segment += sequence_number.to_bytes(
             Constants.HEADER_SEQUENCE_LENGTH, Constants.HEADER_BYTEORDER
         )
-        return headers
+        return segment
 
     @staticmethod
-    def decode_headers(headers: bytes) -> Tuple[Constants.SEGMENT_TYPE, int, int]:
+    def decode_init(segment: bytes) -> Union[Tuple[int, str], None]:
+        segment_type = Constants.SEGMENT_TYPE(int.from_bytes(
+            segment[0 : Constants.HEADER_TYPE_LENGTH], Constants.HEADER_BYTEORDER
+        ))
+        if segment_type != Constants.SEGMENT_TYPE.INIT:
+            return None
+
+        filesize = int.from_bytes(
+            segment[
+                Constants.HEADER_TYPE_LENGTH : Constants.HEADER_TYPE_LENGTH
+                + Constants.HEADER_FILESIZE_LENGTH :
+            ],
+            Constants.HEADER_BYTEORDER,
+        )
+        filename = path.basename(segment[Constants.HEADER_TYPE_LENGTH + Constants.HEADER_FILESIZE_LENGTH::].decode())
+        return (filesize, filename)
+
+    @staticmethod
+    def decode_data_headers(headers: bytes) -> Tuple[Constants.SEGMENT_TYPE, int, int]:
         segment_type = Constants.SEGMENT_TYPE(int.from_bytes(
             headers[0 : Constants.HEADER_TYPE_LENGTH], Constants.HEADER_BYTEORDER
         ))
@@ -111,15 +144,15 @@ class Utilities:
         return (segment_type, sequence_number, crc32sum)
 
     @staticmethod
-    def decode_ack(headers: bytes) -> Union[int, None]:
+    def decode_ack(segment: bytes) -> Union[int, None]:
         segment_type = Constants.SEGMENT_TYPE(int.from_bytes(
-            headers[0 : Constants.HEADER_TYPE_LENGTH], Constants.HEADER_BYTEORDER
+            segment[0 : Constants.HEADER_TYPE_LENGTH], Constants.HEADER_BYTEORDER
         ))
         if segment_type != Constants.SEGMENT_TYPE.ACK:
             return None
 
         sequence_number = int.from_bytes(
-            headers[
+            segment[
                 Constants.HEADER_TYPE_LENGTH : Constants.HEADER_TYPE_LENGTH
                 + Constants.HEADER_SEQUENCE_LENGTH :
             ],
@@ -150,8 +183,9 @@ class Server:
 
         self.__segments: OrderedDict[int, bytes] = OrderedDict()
         self.__pending_ack: List[int] = []
+        self.__acked: List[int] = []
 
-    def send_ack(self, address: Tuple[str, int]):
+    def send_acks(self, address: Tuple[str, int]):
         logging.info(f"sending acks for {self.__pending_ack}")
         self.__recieving = False
         try:
@@ -159,17 +193,23 @@ class Server:
                 segment = Utilities.encode_ack(sequence_number=sequence_number)
                 logging.info(f"sending ack for {sequence_number}")
                 self.__socket.sendto(segment, address)
+                self.__acked.append(sequence_number)
             self.__pending_ack.clear()
         except Exception as exc:
             logging.error(exc)
         self.__recieving = True
 
     def process_segment(self, segment: bytes) -> bool:
-        type, sequence_number, claimed_crc32sum = Utilities.decode_headers(segment)
+        type, sequence_number, claimed_crc32sum = Utilities.decode_data_headers(segment)
         payload = segment[Constants.HEADER_SIZE : :]
         # logging.info(f"payload {payload}")
         if type == Constants.SEGMENT_TYPE.ACK:
-            return False
+            sequence_number = Utilities.decode_ack(segment)
+            if sequence_number in self.__acked:
+                index = self.__acked.index(sequence_number)
+                self.__acked.pop(index)
+                self.__pending_ack.append(index)
+            return True
         if crc32(payload) != claimed_crc32sum:
             logging.warning(f"crc mismatch {claimed_crc32sum} {crc32(payload)}")
             return False
@@ -190,9 +230,30 @@ class Server:
     def recieve(self):
         nulls: int = 0
         possible_nulls: List[bytes] = []
-        filename: str = "file"
         return_address = None
         next_segment: int = 0
+
+
+        filename: Union[str, None] = None
+        filesize: Union[int, None] = None
+
+        while filename is None or filesize is None:
+            ready = select.select([self.__socket], [], [], Constants.CONSECUTIVE_PACKETS_TIMEOUT)
+            if ready[0] and self.__recieving:
+                segment, return_address = self.__socket.recvfrom(Constants.MAX_SEGMENT_SIZE)
+                # logging.info(f"data {segment}")
+                # logging.info(f"nulls {nulls}")
+
+                if segment == b"":
+                    continue
+                else:
+                    logging.debug(f'init segment {segment}')
+                    result = Utilities.decode_init(segment)
+                    if result is None:
+                        continue
+                    filesize, filename = result
+                    self.__pending_ack.append(Constants.INIT_SEQUENCE_NUMBER)
+                    self.send_acks(return_address)
 
         if path.exists(filename):
             unlink(filename)
@@ -231,10 +292,11 @@ class Server:
                             segment = self.__segments.pop(next_segment)
                             # logging.debug(f"writing {next_segment} {segment}")
                             next_segment += len(segment)
+                            logging.debug(f"next should be {next_segment}")
                             file.write(segment)
                 if self.__send_ack_at != -1 and time() >= self.__send_ack_at and return_address is not None:
                     logging.info("sending backlogged ack")
-                    self.send_ack(return_address)
+                    self.send_acks(return_address)
 
 
 class Client:
@@ -254,7 +316,7 @@ class Client:
 
     def send_segment(self, segment_number: int, payload: bytes):
         checksum = crc32(payload)
-        headers = Utilities.encode_headers(Constants.SEGMENT_TYPE.DATA, segment_number, checksum)
+        headers = Utilities.encode_data_headers(segment_number, checksum)
         segment = headers + payload
 
         resend_epoch = time() + Constants.LOSS_TIMEOUT
@@ -264,11 +326,17 @@ class Client:
         # logging.debug(f"sending #{segment_number}({checksum}) {payload}")
         self.__socket.send(segment)
 
-    def send_file(self, filename: str):
+    def send_file(self, filepath: str):
         segment_number = 0
-        filesize = path.getsize(filename)
-        with open(filename, "rb") as file:
+        filesize = path.getsize(filepath)
+        filename = path.basename(filepath)
+        logging.debug(f'filesize {filesize}')
+        with open(filepath, "rb") as file:
             # init
+            payload = Utilities.encode_init(filesize, filename)
+            logging.debug(f'init payload {payload}')
+            self.__socket.send(payload)
+            self.__segment_inflight.append((Constants.INIT_SEQUENCE_NUMBER))
 
             # first pass of data
             while payload := file.read(Constants.MAX_PAYLOAD_SIZE):
@@ -304,7 +372,7 @@ class Client:
                     continue
                 try:
                     logging.info(f'recieved ack for {sequence_number}')
-                    logging.info(f'inflights {list(map(lambda x: x.segment_number, self.__segment_inflight))}')
+                    # logging.info(f'inflights {list(map(lambda x: x.segment_number, self.__segment_inflight))}')
                     self.__segment_inflight = [seg for seg in self.__segment_inflight if seg.segment_number != sequence_number]
 
                 except:
