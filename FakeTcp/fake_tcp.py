@@ -287,6 +287,9 @@ class Server:
                             for segment in possible_nulls:
                                 self.process_segment(segment)
                             possible_nulls = []
+
+                        if next_segment >= filesize:
+                            continue
                         while next_segment in self.__segments.keys():
                             logging.debug(f"got {next_segment}")
                             segment = self.__segments.pop(next_segment)
@@ -294,9 +297,18 @@ class Server:
                             next_segment += len(segment)
                             logging.debug(f"next should be {next_segment}")
                             file.write(segment)
+
                 if self.__send_ack_at != -1 and time() >= self.__send_ack_at and return_address is not None:
                     logging.info("sending backlogged ack")
                     self.send_acks(return_address)
+
+                if next_segment >= filesize:
+                    if return_address is not None:
+                        logging.info("sending ack before exiting")
+                        self.send_acks(return_address)
+                    logging.info("recieved all segment, exiting")
+                    break
+
 
 
 class Client:
@@ -333,10 +345,28 @@ class Client:
         logging.debug(f'filesize {filesize}')
         with open(filepath, "rb") as file:
             # init
-            payload = Utilities.encode_init(filesize, filename)
-            logging.debug(f'init payload {payload}')
-            self.__socket.send(payload)
-            self.__segment_inflight.append((Constants.INIT_SEQUENCE_NUMBER))
+            init_acked = False
+            resend_epoch = 0
+            while init_acked is False:
+                if time() > resend_epoch:
+                    payload = Utilities.encode_init(filesize, filename)
+                    # logging.debug(f'init payload {payload}')
+                    self.__socket.send(payload)
+                    resend_epoch = time() + Constants.LOSS_TIMEOUT
+                    # self.__segment_inflight.append((Constants.INIT_SEQUENCE_NUMBER))
+
+                # wait until init is acked
+                ready = select.select([self.__socket], [], [], Constants.CONSECUTIVE_PACKETS_TIMEOUT)
+                if ready[0]:
+                    segment, _ = self.__socket.recvfrom(Constants.MAX_SEGMENT_SIZE)
+                    if segment == b'':
+                        continue
+                    sequence_number = Utilities.decode_ack(segment)
+                    if sequence_number is None:
+                        continue
+                    if sequence_number == Constants.INIT_SEQUENCE_NUMBER:
+                        logging.info(f'got acked for init ({sequence_number})')
+                        break
 
             # first pass of data
             while payload := file.read(Constants.MAX_PAYLOAD_SIZE):
