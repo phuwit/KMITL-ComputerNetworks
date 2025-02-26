@@ -55,9 +55,10 @@ class Constants:
     ACK_SEGMENT_SIZE = HEADER_TYPE_LENGTH + HEADER_SEQUENCE_LENGTH
 
     LOGGING: bool = True
-    LOSS_TIMEOUT: float = 5
+    LOSS_TIMEOUT: float = 3
     CONSECUTIVE_PACKETS_TIMEOUT: float = 2
     CONNECTION_END_NULLS_COUNT: int = 10
+    MAX_ACK_PER_BATCH: int = 300
 
     INIT_SEQUENCE_NUMBER = int.from_bytes(b'ffff', HEADER_BYTEORDER) -1
 
@@ -70,7 +71,7 @@ class Utilities:
             Constants.HEADER_TYPE_LENGTH, Constants.HEADER_BYTEORDER
         )
         segment += filesize.to_bytes(
-            Constants.HEADER_SEQUENCE_LENGTH, Constants.HEADER_BYTEORDER
+            Constants.HEADER_FILESIZE_LENGTH, Constants.HEADER_BYTEORDER
         )
         segment += filename.encode()
         return segment
@@ -188,13 +189,24 @@ class Server:
     def send_acks(self, address: Tuple[str, int]):
         logging.info(f"sending acks for {self.__pending_ack}")
         self.__recieving = False
+        this_batch = 0
+        processed_acks = []
+
         try:
             for sequence_number in self.__pending_ack:
                 segment = Utilities.encode_ack(sequence_number=sequence_number)
-                logging.info(f"sending ack for {sequence_number}")
+                # logging.debug(f"sending ack for {sequence_number}")
                 self.__socket.sendto(segment, address)
                 self.__acked.append(sequence_number)
-            self.__pending_ack.clear()
+                processed_acks.append(sequence_number)
+                this_batch += 1
+                if this_batch >= Constants.MAX_ACK_PER_BATCH:
+                    break
+
+            # Remove processed ACKs from pending list
+            for ack in processed_acks:
+                if ack in self.__pending_ack:
+                    self.__pending_ack.remove(ack)
         except Exception as exc:
             logging.error(exc)
         self.__recieving = True
@@ -203,12 +215,11 @@ class Server:
         type, sequence_number, claimed_crc32sum = Utilities.decode_data_headers(segment)
         payload = segment[Constants.HEADER_SIZE : :]
         # logging.info(f"payload {payload}")
-        if type == Constants.SEGMENT_TYPE.ACK:
-            sequence_number = Utilities.decode_ack(segment)
-            if sequence_number in self.__acked:
-                index = self.__acked.index(sequence_number)
-                self.__acked.pop(index)
-                self.__pending_ack.append(index)
+
+        if sequence_number in self.__acked:
+            index = self.__acked.index(sequence_number)
+            self.__acked.pop(index)
+            self.__pending_ack.append(sequence_number)
             return True
         if crc32(payload) != claimed_crc32sum:
             logging.warning(f"crc mismatch {claimed_crc32sum} {crc32(payload)}")
@@ -252,6 +263,8 @@ class Server:
                     if result is None:
                         continue
                     filesize, filename = result
+                    logging.debug(f'filesize {filesize}')
+                    logging.debug(f'filename {filename}')
                     self.__pending_ack.append(Constants.INIT_SEQUENCE_NUMBER)
                     self.send_acks(return_address)
 
@@ -260,6 +273,13 @@ class Server:
 
         with open(filename, "ab") as file:
             while True:
+                if next_segment >= filesize:
+                    if return_address is not None:
+                        logging.info("sending ack before exiting")
+                        self.send_acks(return_address)
+                    logging.info("recieved all segment, exiting")
+                    break
+
                 ready = select.select([self.__socket], [], [], Constants.CONSECUTIVE_PACKETS_TIMEOUT)
                 if ready[0] and self.__recieving:
                     segment, return_address = self.__socket.recvfrom(Constants.MAX_SEGMENT_SIZE)
@@ -274,11 +294,14 @@ class Server:
                             logging.warning("closing connection after recieving nulls")
                             break
                     else:
+                        if next_segment >= filesize:
+                            continue
+
                         self.__send_ack_at = time() + Constants.CONSECUTIVE_PACKETS_TIMEOUT
                         if not self.process_segment(segment):
                             continue
                         # logging.debug(f"all segments {self.__segments.keys()}")
-                        logging.debug(f"expecting {next_segment}")
+                        # logging.debug(f"expecting {next_segment}")
                         # logging.debug(f"nulls {nulls}")
                         # logging.debug(f"{next_segment in self.__segments.keys()}")
                         # logging.info(f"segment {segment}")
@@ -288,8 +311,6 @@ class Server:
                                 self.process_segment(segment)
                             possible_nulls = []
 
-                        if next_segment >= filesize:
-                            continue
                         while next_segment in self.__segments.keys():
                             logging.debug(f"got {next_segment}")
                             segment = self.__segments.pop(next_segment)
@@ -301,14 +322,6 @@ class Server:
                 if self.__send_ack_at != -1 and time() >= self.__send_ack_at and return_address is not None:
                     logging.info("sending backlogged ack")
                     self.send_acks(return_address)
-
-                if next_segment >= filesize:
-                    if return_address is not None:
-                        logging.info("sending ack before exiting")
-                        self.send_acks(return_address)
-                    logging.info("recieved all segment, exiting")
-                    break
-
 
 
 class Client:
@@ -322,7 +335,7 @@ class Client:
         self.__socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.__socket.connect((self.__server_ip, self.__server_port))
         self.__socket.settimeout(Constants.LOSS_TIMEOUT)
-        self.__recieve_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.__last_ack: int = 0
 
         self.__segment_inflight: List[InflightSegment] = []
 
@@ -334,7 +347,7 @@ class Client:
         resend_epoch = time() + Constants.LOSS_TIMEOUT
         self.__segment_inflight.append(InflightSegment(segment_number, resend_epoch))
 
-        logging.debug(f"sending #{segment_number}({checksum})")
+        # logging.debug(f"sending #{segment_number}({checksum})")
         # logging.debug(f"sending #{segment_number}({checksum}) {payload}")
         self.__socket.send(segment)
 
@@ -379,20 +392,19 @@ class Client:
             # recieve ack and resend if necessary
             while self.__segment_inflight:
                 resend_segment = self.__segment_inflight[0]
+                # In Client.send_file method:
                 if time() > resend_segment.resend_epoch:
                     segment = self.__segment_inflight.pop(0)
-                    logging.info(f'now is {time()}')
                     logging.info(f'resending {segment.segment_number}')
-                    logging.info(f'expired at {segment.resend_epoch}')
                     if segment.segment_number >= filesize:
                         logging.error(f'aborting resend: out of scope {segment.segment_number}')
                         continue
                     file.seek(segment.segment_number)
                     payload = file.read(Constants.MAX_PAYLOAD_SIZE)
-                    payload_length = len(payload)
-                    segment_number += payload_length
 
-                    self.send_segment(segment_number=segment_number, payload=payload)
+                    # Use the original segment number
+                    self.send_segment(segment_number=segment.segment_number, payload=payload)
+                    segment = b''
 
                 segment, _ = self.__socket.recvfrom(Constants.MAX_SEGMENT_SIZE)
                 if segment == b'':
