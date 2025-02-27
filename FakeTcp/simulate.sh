@@ -14,7 +14,7 @@ function reset_network() {
 case "$1" in
   "start")
     # Parameters: delay_ms loss_percent duplication_percent
-    setup_network "${2:-100}" "${3:-5}" "${4:-5}"
+    setup_network "${2:-200}" "${3:-5}" "${4:-5}"
     ;;
   "stop")
     reset_network
