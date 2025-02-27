@@ -56,12 +56,12 @@ class Constants:
 
     LOGGING: bool = True
     LOSS_TIMEOUT: float = 3
-    CONSECUTIVE_PACKETS_TIMEOUT: float = 2
+    CONSECUTIVE_PACKETS_TIMEOUT: float = 1
+    EXIT_DELAY: float = LOSS_TIMEOUT + CONSECUTIVE_PACKETS_TIMEOUT
     CONNECTION_END_NULLS_COUNT: int = 10
-    MAX_ACK_PER_BATCH: int = 300
+    MAX_ACK_PER_BATCH: int = 200
 
-    INIT_SEQUENCE_NUMBER = int.from_bytes(b'ffff', HEADER_BYTEORDER) -1
-
+    INIT_SEQUENCE_NUMBER = int.from_bytes(b'ffff', HEADER_BYTEORDER)
 
 class Utilities:
     @staticmethod
@@ -180,7 +180,7 @@ class Server:
         self.__recieving: bool = True
         self.__socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.__socket.bind((self.__server_ip, self.__server_port))
-        self.__socket.settimeout(Constants.CONNECTION_END_NULLS_COUNT)
+        self.__socket.settimeout(1.5*Constants.LOSS_TIMEOUT)
 
         self.__segments: OrderedDict[int, bytes] = OrderedDict()
         self.__pending_ack: List[int] = []
@@ -244,10 +244,10 @@ class Server:
         return_address = None
         next_segment: int = 0
 
-
         filename: Union[str, None] = None
         filesize: Union[int, None] = None
 
+        # init
         while filename is None or filesize is None:
             ready = select.select([self.__socket], [], [], Constants.CONSECUTIVE_PACKETS_TIMEOUT)
             if ready[0] and self.__recieving:
@@ -268,11 +268,12 @@ class Server:
                     self.__pending_ack.append(Constants.INIT_SEQUENCE_NUMBER)
                     self.send_acks(return_address)
 
+        # data
         if path.exists(filename):
             unlink(filename)
-
         with open(filename, "ab") as file:
-            while True:
+            while not next_segment >= filesize:
+                # exit if completed
                 if next_segment >= filesize:
                     if return_address is not None:
                         logging.info("sending ack before exiting")
@@ -280,6 +281,7 @@ class Server:
                     logging.info("recieved all segment, exiting")
                     break
 
+                # recieve data
                 ready = select.select([self.__socket], [], [], Constants.CONSECUTIVE_PACKETS_TIMEOUT)
                 if ready[0] and self.__recieving:
                     segment, return_address = self.__socket.recvfrom(Constants.MAX_SEGMENT_SIZE)
@@ -334,7 +336,7 @@ class Client:
         self.__server_port = server_port
         self.__socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.__socket.connect((self.__server_ip, self.__server_port))
-        self.__socket.settimeout(Constants.LOSS_TIMEOUT)
+        self.__socket.settimeout(1.5*Constants.LOSS_TIMEOUT)
         self.__last_ack: int = 0
 
         self.__segment_inflight: List[InflightSegment] = []
@@ -363,6 +365,7 @@ class Client:
             while init_acked is False:
                 if time() > resend_epoch:
                     payload = Utilities.encode_init(filesize, filename)
+                    logging.debug(f'sending init')
                     # logging.debug(f'init payload {payload}')
                     self.__socket.send(payload)
                     resend_epoch = time() + Constants.LOSS_TIMEOUT
@@ -387,38 +390,43 @@ class Client:
                 self.send_segment(segment_number=segment_number, payload=payload)
                 segment_number += payload_length
 
-            self.__segment_inflight = sorted(self.__segment_inflight, key=lambda x: x.resend_epoch)
+                self.__segment_inflight = sorted(self.__segment_inflight, key=lambda x: x.resend_epoch)
 
             # recieve ack and resend if necessary
             while self.__segment_inflight:
                 resend_segment = self.__segment_inflight[0]
-                # In Client.send_file method:
+                logging.debug(f'now {time()}')
+                logging.debug(f'resend queue at {resend_segment.resend_epoch}')
                 if time() > resend_segment.resend_epoch:
                     segment = self.__segment_inflight.pop(0)
                     logging.info(f'resending {segment.segment_number}')
-                    if segment.segment_number >= filesize:
-                        logging.error(f'aborting resend: out of scope {segment.segment_number}')
-                        continue
-                    file.seek(segment.segment_number)
+
+                    # Calculate the correct file position for this sequence number
+                    # You need to track original file positions or calculate them
+                    file_position = segment.segment_number  # This needs to be the correct file position!
+                    file.seek(file_position)
+
                     payload = file.read(Constants.MAX_PAYLOAD_SIZE)
-
-                    # Use the original segment number
                     self.send_segment(segment_number=segment.segment_number, payload=payload)
-                    segment = b''
 
-                segment, _ = self.__socket.recvfrom(Constants.MAX_SEGMENT_SIZE)
-                if segment == b'':
-                    continue
-                sequence_number = Utilities.decode_ack(segment)
-                if sequence_number is None:
-                    continue
-                try:
-                    logging.info(f'recieved ack for {sequence_number}')
-                    # logging.info(f'inflights {list(map(lambda x: x.segment_number, self.__segment_inflight))}')
-                    self.__segment_inflight = [seg for seg in self.__segment_inflight if seg.segment_number != sequence_number]
+                    # Don't discard resent segments - add them back to the inflight queue with a new timeout
+                    # self.__segment_inflight.append(InflightSegment(segment.segment_number, time() + Constants.LOSS_TIMEOUT))
 
-                except:
-                    logging.exception(f"cant pop {sequence_number} from inflight segment")
+                ready = select.select([self.__socket], [], [], Constants.CONSECUTIVE_PACKETS_TIMEOUT)
+                if ready[0]:
+                    segment, _ = self.__socket.recvfrom(Constants.MAX_SEGMENT_SIZE)
+                    if segment == b'':
+                        continue
+                    sequence_number = Utilities.decode_ack(segment)
+                    if sequence_number is None:
+                        continue
+
+                    try:
+                        logging.info(f'recieved ack for {sequence_number}')
+                        # logging.info(f'inflights {list(map(lambda x: x.segment_number, self.__segment_inflight))}')
+                        self.__segment_inflight = [seg for seg in self.__segment_inflight if seg.segment_number != sequence_number]
+                    except:
+                        logging.exception(f"cant pop {sequence_number} from inflight segment")
 
             logging.info('job done')
 
